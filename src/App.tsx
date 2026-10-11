@@ -1,7 +1,10 @@
 import { useEffect, useState } from "react";
 import Lib from "./lib.tsx";
 import { Campus, Worksite, Dashboard } from "./Pages.tsx";
-import { LangContext, LangSwitch, useT } from "./i18n.tsx";
+import Kiosk from "./Kiosk.tsx";
+import SignIn from "./SignIn.tsx";
+import type { Account, Role } from "./SignIn.tsx";
+import { LangContext, LangSwitch } from "./i18n.tsx";
 import type { Lang } from "./i18n.tsx";
 import { API_ON, createReport, listReports, setStatus } from "./api.ts";
 
@@ -32,6 +35,31 @@ const SEED: Report[] = [
 
 const KEY = "heatproof-reports";
 const LANG_KEY = "heatproof-lang";
+const USER_KEY = "heatproof-user";
+
+/* ---------- access control (demo only) ---------- */
+
+type Session = { role: Role; name: string; label: string };
+
+// Which account each page needs. "any" means any signed-in account.
+const REQUIRED: Record<string, Role | "any"> = {
+  "/campus": "campus",
+  "/worksite": "worksite",
+  "/kiosk": "nophone",
+  "/dashboard": "any",
+};
+const ROLE_HOME: Record<Role, string> = { campus: "/campus", worksite: "/worksite", nophone: "/kiosk" };
+const ROLE_NAME: Record<Role, string> = { campus: "Campus", worksite: "Worksite", nophone: "No smartphone" };
+
+function loadUser(): Session | null {
+  try {
+    const raw = sessionStorage.getItem(USER_KEY);
+    if (raw) return JSON.parse(raw) as Session;
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
 
 function loadReports(): Report[] {
   try {
@@ -62,11 +90,12 @@ function readPath(): string {
 }
 
 function Router() {
-  const t = useT();
   const [path, setPath] = useState<string>(readPath());
   const [reports, setReports] = useState<Report[]>(API_ON ? [] : loadReports);
   const [apiError, setApiError] = useState(false);
   const [signIn, setSignIn] = useState(false);
+  const [signInRole, setSignInRole] = useState<Role | undefined>(undefined);
+  const [user, setUser] = useState<Session | null>(loadUser);
 
   const refresh = () =>
     listReports()
@@ -113,15 +142,48 @@ function Router() {
     window.location.hash = p;
   };
 
+  const openSignIn = (role?: Role) => {
+    setSignInRole(role);
+    setSignIn(true);
+  };
+
+  const onSignedIn = (acc: Account) => {
+    const session: Session = { role: acc.role, name: acc.name, label: acc.label };
+    setUser(session);
+    try {
+      sessionStorage.setItem(USER_KEY, JSON.stringify(session));
+    } catch {
+      /* ignore */
+    }
+    setSignIn(false);
+    // stay on the page they wanted if this account may open it, otherwise go to their own mode
+    const need = REQUIRED[path];
+    go(need === "any" || need === acc.role ? path : ROLE_HOME[acc.role]);
+  };
+
+  const signOut = () => {
+    setUser(null);
+    try {
+      sessionStorage.removeItem(USER_KEY);
+    } catch {
+      /* ignore */
+    }
+    go("/");
+  };
+
   const addReport = async (r: NewReport): Promise<string> => {
     if (API_ON) {
       const saved = await createReport(r);
       setReports((prev) => [{ ...saved, time: "Just now" }, ...prev]);
       return saved.id;
     }
-    const max = reports.reduce((m, x) => Math.max(m, Number(x.id.replace("HP-", "")) || 0), 0);
-    const id = "HP-" + String(max + 1).padStart(4, "0");
-    setReports([{ ...r, id, status: "Reported", time: "Just now" }, ...reports]);
+    // functional update so two quick reports never overwrite each other
+    let id = "";
+    setReports((prev) => {
+      const max = prev.reduce((m, x) => Math.max(m, Number(x.id.replace("HP-", "")) || 0), 0);
+      id = "HP-" + String(max + 1).padStart(4, "0");
+      return [{ ...r, id, status: "Reported", time: "Just now" }, ...prev];
+    });
     return id;
   };
 
@@ -137,10 +199,37 @@ function Router() {
 
   const reset = () => setReports(SEED);
 
+  /* ---------- pick the page ---------- */
+
+  const need = REQUIRED[path];
+  const blocked = !!need && !(user && (need === "any" || user.role === need));
+
   let page;
-  if (path === "/campus") page = <Campus go={go} path={path} addReport={addReport} />;
+  if (blocked) {
+    const wanted = need === "any" ? "the dashboard" : `${ROLE_NAME[need as Role]} mode`;
+    page = (
+      <div style={{ maxWidth: 420, margin: "80px auto", padding: 24, textAlign: "center", fontFamily: "sans-serif" }}>
+        <div style={{ fontSize: 48 }}>🔒</div>
+        <h2>{user ? "This account cannot open this page" : "Sign in to continue"}</h2>
+        <p style={{ color: "#475569" }}>
+          {user
+            ? `You are signed in as ${user.label}. Sign out and use the ${ROLE_NAME[need as Role] ?? "right"} account to open ${wanted}.`
+            : `You need an account to open ${wanted}. Use the demo credentials in the sign-in box.`}
+        </p>
+        <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+          {user ? (
+            <button type="button" className="pg-btn" onClick={signOut}>Sign out</button>
+          ) : (
+            <button type="button" className="pg-btn" onClick={() => openSignIn(need === "any" ? undefined : (need as Role))}>Sign in</button>
+          )}
+          <button type="button" className="pg-btn pg-btn-ghost" onClick={() => go("/")}>Back to home</button>
+        </div>
+      </div>
+    );
+  } else if (path === "/campus") page = <Campus go={go} path={path} addReport={addReport} />;
   else if (path === "/worksite") page = <Worksite go={go} path={path} addReport={addReport} reports={reports} />;
   else if (path === "/dashboard") page = <Dashboard go={go} path={path} reports={reports} advance={advance} reset={API_ON ? undefined : reset} apiError={apiError} />;
+  else if (path === "/kiosk") page = <Kiosk go={go} addReport={addReport} />;
   else
     page = (
       <Lib
@@ -148,7 +237,8 @@ function Router() {
         onDashboard={() => go("/dashboard")}
         onCampus={() => go("/campus")}
         onWorksite={() => go("/worksite")}
-        onSignIn={() => setSignIn(true)}
+        onKiosk={() => go("/kiosk")}
+        onSignIn={() => openSignIn()}
         languageSwitcher={<LangSwitch />}
       />
     );
@@ -156,18 +246,27 @@ function Router() {
   return (
     <>
       {page}
-      {signIn && (
-        <div className="pg-backdrop" onClick={() => setSignIn(false)}>
-          <div className="pg-modal" role="dialog" aria-modal="true" aria-label={t("modal.title")} onClick={(e) => e.stopPropagation()}>
-            <h2>{t("modal.title")}</h2>
-            <p>{t("modal.text")}</p>
-            <div className="pg-modal-actions">
-              <button type="button" className="pg-btn" onClick={() => { setSignIn(false); go("/campus"); }}>{t("btn.report")}</button>
-              <button type="button" className="pg-btn pg-btn-ghost" onClick={() => setSignIn(false)}>{t("modal.close")}</button>
-            </div>
-          </div>
+
+      {user && (
+        <div
+          style={{
+            position: "fixed", left: 12, bottom: 12, zIndex: 40, display: "flex", alignItems: "center", gap: 10,
+            background: "#0f172a", color: "#fff", padding: "8px 14px", borderRadius: 999, fontSize: 14,
+            boxShadow: "0 8px 24px rgba(0,0,0,.25)",
+          }}
+        >
+          <span>👤 {user.name} · {user.label}</span>
+          <button
+            type="button"
+            onClick={signOut}
+            style={{ background: "transparent", border: "1px solid #64748b", color: "#fff", borderRadius: 999, padding: "4px 12px", cursor: "pointer" }}
+          >
+            Sign out
+          </button>
         </div>
       )}
+
+      {signIn && <SignIn initialRole={signInRole} onClose={() => setSignIn(false)} onSuccess={onSignedIn} />}
     </>
   );
 }
